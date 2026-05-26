@@ -1,3 +1,16 @@
+---
+title: ASL Sign Translator
+emoji: 🤟
+colorFrom: blue
+colorTo: blue
+sdk: streamlit
+app_file: app.py
+sdk_version: 1.39.0
+python_version: 3.11
+pinned: false
+short_description: Real-time ASL fingerspelling to English speech
+---
+
 # Sign Translator — ASL Model
 
 Real-time American Sign Language (ASL) fingerspelling recognition with AI-powered sentence cleanup and text-to-speech.
