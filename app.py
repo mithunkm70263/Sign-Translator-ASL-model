@@ -14,7 +14,10 @@ from mediapipe.python.solutions.hands import HAND_CONNECTIONS as _MP_HAND_CONNEC
 import numpy as np
 import joblib
 from groq import Groq
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 from gtts import gTTS
 import tempfile
 import time
@@ -166,7 +169,7 @@ if groq_api_key:
 else:
     groq_client = None
 
-if gemini_api_key:
+if gemini_api_key and genai is not None:
     genai.configure(api_key=gemini_api_key)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 else:
