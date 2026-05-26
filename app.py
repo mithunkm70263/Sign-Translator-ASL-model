@@ -14,7 +14,7 @@ from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 import joblib
 from groq import Groq
-import google.generativeai as genai
+import httpx
 from gtts import gTTS
 import tempfile
 import time
@@ -179,11 +179,23 @@ if groq_api_key:
 else:
     groq_client = None
 
-if gemini_api_key:
-    genai.configure(api_key=gemini_api_key)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    gemini_model = None
+def _gemini_clean_text(text: str, system_prompt: str) -> str:
+    """Gemini via REST (no google-generativeai — avoids heavy pip conflicts on Cloud)."""
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-1.5-flash:generateContent"
+    )
+    payload = {
+        "contents": [
+            {"parts": [{"text": f"{system_prompt}\n\nUSER INPUT: {text}"}]}
+        ],
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 128},
+    }
+    with httpx.Client(timeout=30.0) as client:
+        resp = client.post(url, params={"key": gemini_api_key}, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
 # --- MEDIAPIPE FEATURES PIPELINE ---
@@ -700,16 +712,11 @@ Your absolute core mission:
                         st.warning(f"Groq API failed. Falling back to Gemini... ({e})")
                 
                 # Fallback to Gemini if Groq failed or is not available
-                if not translation_success and gemini_model:
+                if not translation_success and gemini_api_key:
                     try:
-                        response = gemini_model.generate_content(
-                            f"{system_prompt}\n\nUSER INPUT: {full_text}",
-                            generation_config=genai.types.GenerationConfig(
-                                temperature=0.25,
-                                max_output_tokens=128,
-                            )
+                        st.session_state.groq_output = _gemini_clean_text(
+                            full_text, system_prompt
                         )
-                        st.session_state.groq_output = response.text.strip()
                         translation_success = True
                     except Exception as e:
                         st.error(f"Gemini API failed as well: {e}")
