@@ -17,6 +17,10 @@ from collections import deque, Counter
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
 
+# Force-load MediaPipe hands module in the main thread NOW so that
+# the lazy-loader does not race/fail when called from a WebRTC background thread.
+_MP_HANDS = mp.solutions.hands
+
 # --- STYLING & PREMIUM CUSTOM THEME ---
 st.set_page_config(
     page_title="ASL Sign Language Translator",
@@ -395,9 +399,8 @@ class ASLVideoProcessor(VideoProcessorBase):
         self.left_state = HandState()
         self.right_state = HandState()
         
-        # MediaPipe Hands
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
+        # MediaPipe Hands — use pre-loaded module from main thread
+        self.hands = _MP_HANDS.Hands(
             static_image_mode=False,
             max_num_hands=2,
             min_detection_confidence=0.6,
