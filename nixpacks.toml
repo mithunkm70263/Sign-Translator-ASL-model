@@ -1,0 +1,2 @@
+[system]
+packages = ["libxcb", "libxkbcommon", "libxrender", "libxext"]
