@@ -7,13 +7,9 @@ APP_DIR = Path(__file__).resolve().parent
 
 import streamlit as st
 import cv2
-
-# Use explicit import path — bypasses mp.solutions lazy attribute chain
-# which fails on Streamlit Cloud when the solutions subpackage isn't
-# registered as an attribute of the top-level mediapipe module.
 import mediapipe as mp
-from mediapipe.python.solutions.hands import Hands as _MPHands
-from mediapipe.python.solutions.hands import HAND_CONNECTIONS as _MP_HAND_CONNECTIONS
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 import numpy as np
 import joblib
@@ -26,13 +22,6 @@ import threading
 from collections import deque, Counter
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
-
-# Force-load MediaPipe hands in the main thread so the lazy-loader does not
-# race/fail when called from a WebRTC background thread (Streamlit Cloud safe).
-try:
-    _ = mp.solutions.hands
-except AttributeError:
-    _ = _MPHands  # direct import already loaded above
 
 # --- STYLING & PREMIUM CUSTOM THEME ---
 st.set_page_config(
@@ -145,6 +134,22 @@ if model is None or labels is None:
     st.stop()
 
 
+@st.cache_resource
+def get_hand_landmarker():
+    """Bundled .task model — no download/write to site-packages on Streamlit Cloud."""
+    model_path = APP_DIR / "hand_landmarker.task"
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Missing hand_landmarker.task at {model_path}")
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        num_hands=2,
+        min_hand_detection_confidence=0.6,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.HandLandmarker.create_from_options(options)
+
+
 # --- GET GROQ & GEMINI API KEYS ---
 groq_api_key = None
 gemini_api_key = None
@@ -212,9 +217,9 @@ def _entropy(p):
     p = np.clip(p, 1e-12, 1.0)
     return float(-np.sum(p * np.log(p)))
 
-def extract_features(landmarks_proto, is_left=False):
+def extract_features(landmarks, is_left=False):
     coords = np.array(
-        [[lm.x, lm.y, lm.z] for lm in landmarks_proto.landmark],
+        [[lm.x, lm.y, lm.z] for lm in landmarks],
         dtype=np.float32,
     )
     # Wrist origin center
@@ -237,11 +242,11 @@ def extract_features(landmarks_proto, is_left=False):
 
 
 # --- HUD & LANDMARK DRAWING FUNCTIONS (MATCHES LETTER_DETECTION.PY) ---
-def draw_hand(frame, landmarks_proto, handedness):
+def draw_hand(frame, landmarks, handedness):
     """Draw landmarks with hand-specific colours."""
     h, w = frame.shape[:2]
     c = COLORS.get(handedness, COLORS["Right"])
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks_proto.landmark]
+    pts = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
     for s, e in HAND_CONNECTIONS:
         cv2.line(frame, pts[s], pts[e], c["line"], 2)
     for i, pt in enumerate(pts):
@@ -435,14 +440,7 @@ class ASLVideoProcessor(VideoProcessorBase):
         # Hand tracking states
         self.left_state = HandState()
         self.right_state = HandState()
-        
-        # MediaPipe Hands — using direct import, no mp.solutions attribute chain
-        self.hands = _MPHands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.6,
-            min_tracking_confidence=0.5,
-        )
+        self.landmarker = get_hand_landmarker()
 
     def recv(self, frame):
         # 1. Convert video frame to numpy array
@@ -460,32 +458,29 @@ class ASLVideoProcessor(VideoProcessorBase):
             self.fps_count = 0
             self.fps_timer = now
             
-        # 4. MediaPipe on downscaled frame (landmarks are normalized 0–1)
+        # 4. MediaPipe Tasks API on downscaled frame (bundled hand_landmarker.task)
         infer = cv2.resize(img, (INFER_WIDTH, INFER_HEIGHT), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(infer, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = self.hands.process(rgb)
-        rgb.flags.writeable = True
-        
+        rgb = np.ascontiguousarray(cv2.cvtColor(infer, cv2.COLOR_BGR2RGB))
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = self.landmarker.detect(mp_image)
+
         detected = {"Left": None, "Right": None}
-        if results.multi_hand_landmarks and results.multi_handedness:
-            for lm, info in zip(results.multi_hand_landmarks, results.multi_handedness):
-                # Flipping the frame before MediaPipe means Left hand maps to Left, Right to Right
-                hand_label = info.classification[0].label # "Left" or "Right"
-                detected[hand_label] = lm
+        if results.hand_landmarks:
+            for i, hand_lms in enumerate(results.hand_landmarks):
+                hand_label = "Right"
+                if results.handedness and i < len(results.handedness):
+                    hand_label = results.handedness[i][0].category_name
+                detected[hand_label] = hand_lms
                 
         self.hands_detected = any(v is not None for v in detected.values())
         
         # 5. Process left & right hands
-        for side, lm_proto in detected.items():
+        for side, hand_lms in detected.items():
             state = self.left_state if side == "Left" else self.right_state
-            if lm_proto is not None:
-                # Draw custom landmarks on frame
-                draw_hand(img, lm_proto, side)
-                
-                # Feature engineering + prediction
-                is_left = (side == "Left")
-                feat = extract_features(lm_proto, is_left).reshape(1, -1)
+            if hand_lms is not None:
+                draw_hand(img, hand_lms, side)
+                is_left = side == "Left"
+                feat = extract_features(hand_lms, is_left).reshape(1, -1)
                 
                 if model is not None:
                     proba = model.predict_proba(feat)[0]

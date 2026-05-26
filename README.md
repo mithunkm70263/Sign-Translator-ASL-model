@@ -27,7 +27,7 @@ GEMINI_API_KEY = "your-gemini-key"
 
 ## Deploy on Streamlit Community Cloud
 
-**Important:** `packages.txt` must contain only `libgl1` (not `libgl1-mesa-glx` or `libglib2.0-0`). If apt install failed on an older deploy, delete the app on Streamlit Cloud and create it again so dependencies reinstall cleanly.
+**Important:** Do **not** add a `packages.txt` file (apt packages break on Streamlit Cloud). Hand tracking uses the bundled `hand_landmarker.task` in this repo. If a previous deploy failed, **delete the app** on Streamlit Cloud and create it again.
 
 1. Push this repo to GitHub (see below).
 2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
