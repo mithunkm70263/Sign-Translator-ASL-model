@@ -1,6 +1,5 @@
 libgl1
-libglib2.0-0t64
+libglib2.0-0
 libsm6
 libxext6
 libxrender1
-libxkbcommon-x11-0

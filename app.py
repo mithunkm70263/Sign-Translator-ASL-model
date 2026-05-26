@@ -23,9 +23,12 @@ from collections import deque, Counter
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
 
-# Force-load MediaPipe hands module in the main thread NOW so that
-# the lazy-loader does not race/fail when called from a WebRTC background thread.
-_MP_HANDS = mp.solutions.hands
+# Force-load MediaPipe hands in the main thread so the lazy-loader does not
+# race/fail when called from a WebRTC background thread (Streamlit Cloud safe).
+try:
+    _ = mp.solutions.hands
+except AttributeError:
+    _ = _MPHands  # direct import already loaded above
 
 # --- STYLING & PREMIUM CUSTOM THEME ---
 st.set_page_config(
