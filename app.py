@@ -662,13 +662,13 @@ with col_control:
         else:
             with st.spinner("AI is reconstructing sentence..."):
                 translation_success = False
-                system_prompt = \"\"\"You are an legendary, ultra-intelligent AI communication assistant translating raw fingerspelled ASL text for a deaf or speech-impaired user.
+                system_prompt = """You are an legendary, ultra-intelligent AI communication assistant translating raw fingerspelled ASL text for a deaf or speech-impaired user.
 The input is highly corrupted text generated live from a sign-recognition computer vision model. It has letter repetitions, missing vowels, visual spelling typos, and no punctuation.
 Your absolute core mission:
 - Deduplicate repeated letters and correct visual/spelling typos contextually.
 - Intelligently reconstruct the complete, highly natural, beautifully polished spoken English message.
 - Maintain the user's intent. If they signed shorthand like "GD MRNG", output "Good morning."
-- Return ONLY the final clean sentence. NEVER write any introduction, explanation, quotes, or meta-commentary.\"\"\"
+- Return ONLY the final clean sentence. NEVER write any introduction, explanation, quotes, or meta-commentary."""
 
                 # Try Groq API First
                 if groq_client:
