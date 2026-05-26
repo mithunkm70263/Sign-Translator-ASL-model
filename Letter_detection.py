@@ -46,11 +46,10 @@ def _angle_between(v1, v2):
     return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
 
 
-def extract_features(hand_landmarks_proto, is_left_hand=False):
+def extract_features(hand_landmarks_proto, mirror_x=False):
     """
     Extract 78-dim feature vector from hand landmarks.
-    If is_left_hand=True, mirrors x-axis so left-hand signs
-    match right-hand training data.
+    mirror_x=True flips the x-axis so inference can handle mirrored cameras.
     """
     coords = np.array(
         [[lm.x, lm.y, lm.z] for lm in hand_landmarks_proto.landmark],
@@ -63,8 +62,7 @@ def extract_features(hand_landmarks_proto, is_left_hand=False):
     scale = np.linalg.norm(coords[9]) + 1e-6
     coords /= scale
 
-    # Mirror x-axis for Right hand → matches Left-hand training data
-    if is_left_hand == False: # True when it's the Right hand
+    if mirror_x:
         coords[:, 0] *= -1
 
     # Joint angle features (15)
@@ -75,6 +73,19 @@ def extract_features(hand_landmarks_proto, is_left_hand=False):
     )
 
     return np.concatenate([coords.flatten(), angles])  # (78,)
+
+
+def predict_best_orientation(hand_landmarks_proto):
+    """Try both webcam orientations and keep the model's stronger prediction."""
+    normal = extract_features(hand_landmarks_proto, mirror_x=False).reshape(1, -1)
+    mirrored = extract_features(hand_landmarks_proto, mirror_x=True).reshape(1, -1)
+
+    normal_proba = model.predict_proba(normal)[0]
+    mirrored_proba = model.predict_proba(mirrored)[0]
+
+    if float(np.max(mirrored_proba)) > float(np.max(normal_proba)):
+        return mirrored_proba
+    return normal_proba
 
 
 def clean_with_groq(raw_text):
@@ -494,8 +505,9 @@ while True:
     if results.multi_hand_landmarks and results.multi_handedness:
         for lm, info in zip(results.multi_hand_landmarks, results.multi_handedness):
             # MediaPipe reports handedness from camera perspective,
-            # but we flipped the image → labels match user's actual hands.
+            # and the displayed image is mirrored, so swap back to the user's hand.
             hand_label = info.classification[0].label   # "Left" or "Right"
+            hand_label = "Left" if hand_label == "Right" else "Right"
             detected[hand_label] = lm
 
     hands_detected = any(v is not None for v in detected.values())
@@ -507,9 +519,7 @@ while True:
         if lm_proto is not None:
             draw_hand(frame, lm_proto, side)
 
-            is_left = (side == "Left")
-            feat    = extract_features(lm_proto, is_left_hand=is_left).reshape(1, -1)
-            proba   = model.predict_proba(feat)[0]
+            proba   = predict_best_orientation(lm_proto)
             state.update(proba)
         else:
             state.reset()

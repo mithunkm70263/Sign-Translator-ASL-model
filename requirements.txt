@@ -7,3 +7,4 @@ gtts
 numpy
 scikit-learn
 av
+twilio

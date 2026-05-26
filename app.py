@@ -20,8 +20,64 @@ import tempfile
 import time
 import threading
 from collections import deque, Counter
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+from streamlit_webrtc import (
+    RTCConfiguration,
+    VideoProcessorBase,
+    WebRtcMode,
+    webrtc_streamer,
+)
 import av
+
+@st.cache_resource
+def get_ice_servers():
+    """Use Twilio's TURN servers for robust scaling if credentials are provided."""
+    ice_servers = [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {
+            "urls": ["turn:openrelay.metered.ca:80"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        }
+    ]
+    
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    
+    try:
+        if not account_sid and "TWILIO_ACCOUNT_SID" in st.secrets:
+            account_sid = st.secrets["TWILIO_ACCOUNT_SID"]
+            auth_token = st.secrets["TWILIO_AUTH_TOKEN"]
+    except Exception:
+        pass
+
+    if account_sid and auth_token:
+        try:
+            from twilio.rest import Client
+            client = Client(account_sid, auth_token)
+            token = client.tokens.create()
+            return token.ice_servers
+        except ImportError:
+            st.warning("twilio package not installed. Add 'twilio' to requirements.txt for robust WebRTC.")
+        except Exception as e:
+            print(f"Twilio ICE server fetch failed: {e}")
+            
+    return ice_servers
+
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": get_ice_servers()})
+
+MEDIA_STREAM_CONSTRAINTS = {
+    "video": {
+        "facingMode": "user",
+        "width": {"ideal": 640},
+        "height": {"ideal": 480},
+    },
+    "audio": False,
+}
 
 # --- STYLING & PREMIUM CUSTOM THEME ---
 st.set_page_config(
@@ -101,6 +157,12 @@ st.markdown("""
         border-radius: 10px;
         padding: 10px 15px;
     }
+
+    /* Live camera area */
+    div[data-testid="stWebRtcStreamer"] {
+        min-height: 360px;
+        width: 100%;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -134,31 +196,65 @@ if model is None or labels is None:
     st.stop()
 
 
-@st.cache_resource
-def get_hand_landmarker():
-    """Bundled .task model — no download/write to site-packages on Streamlit Cloud."""
+_HAND_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+)
+
+
+_landmarker = None
+_landmarker_lock = threading.Lock()
+_model_ready = threading.Event()
+
+
+def _ensure_hand_model_file() -> str:
+    """Download .task file once — plain Python (safe inside WebRTC worker thread)."""
     model_path = APP_DIR / "hand_landmarker.task"
     if not model_path.is_file():
-        raise FileNotFoundError(f"Missing hand_landmarker.task at {model_path}")
-    options = mp_vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-        num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    return mp_vision.HandLandmarker.create_from_options(options)
+        import urllib.request
+        urllib.request.urlretrieve(_HAND_MODEL_URL, model_path)
+    return str(model_path)
+
+
+def _get_landmarker():
+    """Thread-safe singleton — never call st.cache_resource from the camera thread."""
+    global _landmarker
+    if _landmarker is None:
+        with _landmarker_lock:
+            if _landmarker is None:
+                options = mp_vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(
+                        model_asset_path=_ensure_hand_model_file()
+                    ),
+                    num_hands=2,
+                    min_hand_detection_confidence=0.6,
+                    min_hand_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+                _landmarker = mp_vision.HandLandmarker.create_from_options(options)
+                _model_ready.set()
+    return _landmarker
+
+
+def _warmup_in_background():
+    try:
+        _get_landmarker()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup_in_background, daemon=True).start()
 
 
 # --- GET GROQ & GEMINI API KEYS ---
-groq_api_key = None
-gemini_api_key = None
+groq_api_key = os.getenv("GROQ_API_KEY")
+gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 try:
     if "GROQ_API_KEY" in st.secrets:
-        groq_api_key = st.secrets["GROQ_API_KEY"]
+        groq_api_key = groq_api_key or st.secrets["GROQ_API_KEY"]
     if "GEMINI_API_KEY" in st.secrets:
-        gemini_api_key = st.secrets["GEMINI_API_KEY"]
+        gemini_api_key = gemini_api_key or st.secrets["GEMINI_API_KEY"]
 except Exception:
     pass
 
@@ -229,7 +325,7 @@ def _entropy(p):
     p = np.clip(p, 1e-12, 1.0)
     return float(-np.sum(p * np.log(p)))
 
-def extract_features(landmarks, is_left=False):
+def extract_features(landmarks, mirror_x=False):
     coords = np.array(
         [[lm.x, lm.y, lm.z] for lm in landmarks],
         dtype=np.float32,
@@ -240,8 +336,7 @@ def extract_features(landmarks, is_left=False):
     scale = np.linalg.norm(coords[9]) + 1e-6
     coords /= scale
 
-    # Mirror x if Right hand to align with Left-hand training data representation
-    if not is_left:
+    if mirror_x:
         coords[:, 0] *= -1
 
     # Joint angles
@@ -251,6 +346,19 @@ def extract_features(landmarks, is_left=False):
         dtype=np.float32,
     )
     return np.concatenate([coords.flatten(), angles])
+
+
+def predict_best_orientation(landmarks):
+    """Try both webcam orientations and keep the model's stronger prediction."""
+    normal = extract_features(landmarks, mirror_x=False).reshape(1, -1)
+    mirrored = extract_features(landmarks, mirror_x=True).reshape(1, -1)
+
+    normal_proba = model.predict_proba(normal)[0]
+    mirrored_proba = model.predict_proba(mirrored)[0]
+
+    if float(np.max(mirrored_proba)) > float(np.max(normal_proba)):
+        return mirrored_proba
+    return normal_proba
 
 
 # --- HUD & LANDMARK DRAWING FUNCTIONS (MATCHES LETTER_DETECTION.PY) ---
@@ -428,9 +536,9 @@ class HandState:
                 self.stable_confidence = ema_conf
 
 
-# Inference resolution — smaller frame = faster on Streamlit Cloud CPUs
-INFER_WIDTH = 640
-INFER_HEIGHT = 480
+# Smaller inference = faster frames on Hugging Face CPUs
+INFER_WIDTH = 480
+INFER_HEIGHT = 360
 
 
 # --- WEBRTC ASL PROCESSING CLASS ---
@@ -452,164 +560,151 @@ class ASLVideoProcessor(VideoProcessorBase):
         # Hand tracking states
         self.left_state = HandState()
         self.right_state = HandState()
-        self.landmarker = get_hand_landmarker()
+        self.last_detected = {"Left": None, "Right": None}
+        self._frame_n = 0
 
     def recv(self, frame):
-        # 1. Convert video frame to numpy array
-        img = frame.to_ndarray(format="bgr24")
-        h, w = img.shape[:2]
-        
-        # 2. Mirror frame horizontally for user friendly view
-        img = cv2.flip(img, 1)
-        
-        # 3. Calculate FPS
-        self.fps_count += 1
-        now = time.perf_counter()
-        if now - self.fps_timer >= 0.5:
-            self.fps = self.fps_count / (now - self.fps_timer)
-            self.fps_count = 0
-            self.fps_timer = now
-            
-        # 4. MediaPipe Tasks API on downscaled frame (bundled hand_landmarker.task)
-        infer = cv2.resize(img, (INFER_WIDTH, INFER_HEIGHT), interpolation=cv2.INTER_LINEAR)
-        rgb = np.ascontiguousarray(cv2.cvtColor(infer, cv2.COLOR_BGR2RGB))
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        results = self.landmarker.detect(mp_image)
+        try:
+            img = frame.to_ndarray(format="bgr24")
+            img = cv2.flip(img, 1)
+        except Exception:
+            return frame
 
-        detected = {"Left": None, "Right": None}
-        if results.hand_landmarks:
-            for i, hand_lms in enumerate(results.hand_landmarks):
-                hand_label = "Right"
-                if results.handedness and i < len(results.handedness):
-                    hand_label = results.handedness[i][0].category_name
-                detected[hand_label] = hand_lms
-                
-        self.hands_detected = any(v is not None for v in detected.values())
-        
-        # 5. Process left & right hands
-        for side, hand_lms in detected.items():
-            state = self.left_state if side == "Left" else self.right_state
-            if hand_lms is not None:
-                draw_hand(img, hand_lms, side)
-                is_left = side == "Left"
-                feat = extract_features(hand_lms, is_left).reshape(1, -1)
-                
-                if model is not None:
-                    proba = model.predict_proba(feat)[0]
-                    state.update(proba)
-            else:
-                state.reset()
-                
-        # 6. Thread-safe word and sentence builder logic
-        with self.lock:
-            dom_state = self.left_state if self.dominant_hand == "Left" else self.right_state
-            if dom_state.stable_letter and dom_state.stable_letter != self.last_added_letter:
-                letter = dom_state.stable_letter
-                if letter == "space":
-                    if self.current_word:
-                        self.current_sentence += self.current_word + " "
-                        self.current_word = ""
-                elif letter == "del":
-                    self.current_word = self.current_word[:-1]
-                elif letter == "nothing":
-                    pass
-                else:
-                    self.current_word += letter
-                self.last_added_letter = letter
-                
-            # Reset last added letter when dominant hand is removed
-            if detected[self.dominant_hand] is None:
-                self.last_added_letter = ""
-                self.no_hand_frames += 1
-            else:
-                self.no_hand_frames = 0
-                
-        # 7. Draw HUD panels directly on the image frame
-        draw_hud(img, self.left_state, self.right_state, self.dominant_hand,
-                 self.current_word, self.current_sentence, self.fps, self.hands_detected)
-                         
+        # Never block on model load here — that disconnects WebRTC on Hugging Face
+        if _landmarker is None or not _model_ready.is_set():
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        try:
+            self._frame_n += 1
+
+            self.fps_count += 1
+            now = time.perf_counter()
+            if now - self.fps_timer >= 0.5:
+                self.fps = self.fps_count / (now - self.fps_timer)
+                self.fps_count = 0
+                self.fps_timer = now
+
+            if self._frame_n % 3 == 0:
+                infer = cv2.resize(img, (INFER_WIDTH, INFER_HEIGHT), interpolation=cv2.INTER_LINEAR)
+                rgb = np.ascontiguousarray(cv2.cvtColor(infer, cv2.COLOR_BGR2RGB))
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                results = _landmarker.detect(mp_image)
+
+                detected = {"Left": None, "Right": None}
+                if results.hand_landmarks:
+                    for i, hand_lms in enumerate(results.hand_landmarks):
+                        hand_label = "Right"
+                        if results.handedness and i < len(results.handedness):
+                            hand_label = results.handedness[i][0].category_name
+                            hand_label = "Left" if hand_label == "Right" else "Right"
+                        detected[hand_label] = hand_lms
+
+                self.hands_detected = any(v is not None for v in detected.values())
+                self.last_detected = detected
+
+                for side, hand_lms in detected.items():
+                    state = self.left_state if side == "Left" else self.right_state
+                    if hand_lms is not None:
+                        if model is not None:
+                            proba = predict_best_orientation(hand_lms)
+                            state.update(proba)
+                    else:
+                        state.reset()
+
+                with self.lock:
+                    dom_state = self.left_state if self.dominant_hand == "Left" else self.right_state
+                    if dom_state.stable_letter and dom_state.stable_letter != self.last_added_letter:
+                        letter = dom_state.stable_letter
+                        if letter == "space":
+                            if self.current_word:
+                                self.current_sentence += self.current_word + " "
+                                self.current_word = ""
+                        elif letter == "del":
+                            self.current_word = self.current_word[:-1]
+                        elif letter != "nothing":
+                            self.current_word += letter
+                        self.last_added_letter = letter
+
+                    if detected[self.dominant_hand] is None:
+                        self.last_added_letter = ""
+                        self.no_hand_frames += 1
+                    else:
+                        self.no_hand_frames = 0
+
+            # Always draw UI elements on every frame to avoid flickering
+            for side, hand_lms in self.last_detected.items():
+                if hand_lms is not None:
+                    draw_hand(img, hand_lms, side)
+
+            draw_hud(
+                img, self.left_state, self.right_state, self.dominant_hand,
+                self.current_word, self.current_sentence, self.fps, self.hands_detected,
+            )
+        except Exception:
+            pass
+
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # --- STREAMLIT UI LAYOUT ---
 
-# Top Banner
 st.markdown('<div class="glowing-title">🤟 ASL Fingerspelling & Speech Assistant</div>', unsafe_allow_html=True)
 st.markdown('<p style="color:#8a9ba8; font-size:1.15rem; margin-top:-5px; margin-bottom:2rem;">Translating fingerspelled sign language into fluent spoken English in real-time</p>', unsafe_allow_html=True)
 
-# Define columns
+if not _model_ready.is_set():
+    st.caption("Loading hand model in the background… You can start the camera anytime.")
+
 col_cam, col_control = st.columns([1.1, 0.9])
 
 with col_cam:
     st.markdown('<div class="glass-card glow-panel-left">', unsafe_allow_html=True)
     st.markdown('<div class="panel-subheader">📷 Real-time Video Stream</div>', unsafe_allow_html=True)
-    
-    # Render Streamlit-WebRTC camera feed
+
     ctx = webrtc_streamer(
         key="asl",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
         video_processor_factory=ASLVideoProcessor,
-        rtc_configuration={
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["turn:openrelay.metered.ca:80"], "username": "openrelayproject", "credential": "openrelayproject"},
-                {"urls": ["turn:openrelay.metered.ca:443"], "username": "openrelayproject", "credential": "openrelayproject"},
-                {"urls": ["turn:openrelay.metered.ca:443?transport=tcp"], "username": "openrelayproject", "credential": "openrelayproject"},
-            ]
-        },
-        media_stream_constraints={
-            "video": {
-                "width": {"ideal": 640, "max": 1280},
-                "height": {"ideal": 480, "max": 720},
-                "frameRate": {"ideal": 24, "max": 30},
-            },
-            "audio": False,
-        },
+        media_stream_constraints=MEDIA_STREAM_CONSTRAINTS,
         async_processing=True,
     )
-    
-    # Instruction card beneath camera
-    st.info("💡 **Webcam Instructions**: Start your camera above. Align your hand inside the frame. The HUD overlays show your predictions, confidence, and letters in real-time. Keep a sign stable for ~2 frames to append it!")
+
+    st.info("💡 Click **START**, allow camera access, then sign in the frame.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-
-# --- PROCESSOR DATA SYNCHRONIZATION ---
-if ctx.video_processor:
-    # Read active thread states safely with locks
-    with ctx.video_processor.lock:
-        current_word = ctx.video_processor.current_word
-        current_sentence = ctx.video_processor.current_sentence
-        hands_detected = ctx.video_processor.hands_detected
-else:
-    # Fallback to local session states if camera not active
-    current_word = st.session_state.current_word
-    current_sentence = st.session_state.current_sentence
-    hands_detected = False
+st.session_state.webrtc_ctx = ctx
 
 
-# --- CONTROLS AND INTERACTION HANDLERS ---
+def _sync_dominant_hand():
+    proc_ctx = st.session_state.get("webrtc_ctx")
+    if proc_ctx and proc_ctx.video_processor:
+        with proc_ctx.video_processor.lock:
+            proc_ctx.video_processor.dominant_hand = st.session_state.dominant_hand_pick
+
+
 def handle_space():
-    # Sync processor
-    if ctx.video_processor:
-        with ctx.video_processor.lock:
-            if ctx.video_processor.current_word:
-                ctx.video_processor.current_sentence += ctx.video_processor.current_word + " "
-                ctx.video_processor.current_word = ""
-    # Sync fallback
+    proc_ctx = st.session_state.get("webrtc_ctx")
+    if proc_ctx and proc_ctx.video_processor:
+        with proc_ctx.video_processor.lock:
+            if proc_ctx.video_processor.current_word:
+                proc_ctx.video_processor.current_sentence += proc_ctx.video_processor.current_word + " "
+                proc_ctx.video_processor.current_word = ""
     if st.session_state.current_word:
         st.session_state.current_sentence += st.session_state.current_word + " "
         st.session_state.current_word = ""
     st.session_state.last_action = "Appended Space"
 
+
 def handle_backspace():
-    if ctx.video_processor:
-        with ctx.video_processor.lock:
-            if ctx.video_processor.current_word:
-                ctx.video_processor.current_word = ctx.video_processor.current_word[:-1]
-            elif ctx.video_processor.current_sentence:
-                parts = ctx.video_processor.current_sentence.strip().split(" ")
-                ctx.video_processor.current_word = parts[-1]
-                ctx.video_processor.current_sentence = " ".join(parts[:-1]) + " " if len(parts) > 1 else ""
-    
+    proc_ctx = st.session_state.get("webrtc_ctx")
+    if proc_ctx and proc_ctx.video_processor:
+        with proc_ctx.video_processor.lock:
+            if proc_ctx.video_processor.current_word:
+                proc_ctx.video_processor.current_word = proc_ctx.video_processor.current_word[:-1]
+            elif proc_ctx.video_processor.current_sentence:
+                parts = proc_ctx.video_processor.current_sentence.strip().split(" ")
+                proc_ctx.video_processor.current_word = parts[-1]
+                proc_ctx.video_processor.current_sentence = " ".join(parts[:-1]) + " " if len(parts) > 1 else ""
     if st.session_state.current_word:
         st.session_state.current_word = st.session_state.current_word[:-1]
     elif st.session_state.current_sentence:
@@ -618,13 +713,15 @@ def handle_backspace():
         st.session_state.current_sentence = " ".join(parts[:-1]) + " " if len(parts) > 1 else ""
     st.session_state.last_action = "Deleted last character"
 
+
 def handle_clear():
-    if ctx.video_processor:
-        with ctx.video_processor.lock:
-            ctx.video_processor.current_word = ""
-            ctx.video_processor.current_sentence = ""
-            ctx.video_processor.left_state.reset()
-            ctx.video_processor.right_state.reset()
+    proc_ctx = st.session_state.get("webrtc_ctx")
+    if proc_ctx and proc_ctx.video_processor:
+        with proc_ctx.video_processor.lock:
+            proc_ctx.video_processor.current_word = ""
+            proc_ctx.video_processor.current_sentence = ""
+            proc_ctx.video_processor.left_state.reset()
+            proc_ctx.video_processor.right_state.reset()
     st.session_state.current_word = ""
     st.session_state.current_sentence = ""
     st.session_state.groq_output = ""
@@ -632,61 +729,70 @@ def handle_clear():
 
 
 with col_control:
-    st.markdown('<div class="glass-card glow-panel-right">', unsafe_allow_html=True)
-    st.markdown('<div class="panel-subheader">⚙️ Configuration & Signing</div>', unsafe_allow_html=True)
-    
-    # Dominant signing hand radio select (updates background processor real-time)
-    selected_dom = st.radio(
-        "Dominant Signing Hand:", 
-        ["Right", "Left"], 
-        horizontal=True, 
-        index=0 if (ctx.video_processor and ctx.video_processor.dominant_hand == "Right") else 1 if (ctx.video_processor and ctx.video_processor.dominant_hand == "Left") else 0,
-        help="Switches the stabilization focus to the selected hand."
-    )
-    
-    if ctx.video_processor:
-        with ctx.video_processor.lock:
-            ctx.video_processor.dominant_hand = selected_dom
-            
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    # Word and sentence building state
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<div class="panel-subheader">📝 Construction Progress</div>', unsafe_allow_html=True)
-    
-    metric_word = current_word if current_word else "_"
-    metric_sent = current_sentence if current_sentence else "..."
-    
-    c_m1, c_m2 = st.columns(2)
-    with c_m1:
-        st.metric("Current Word", metric_word)
-    with c_m2:
-        st.metric("Accumulated Sentence", metric_sent)
-        
-    # Extra word building controls
-    c_b1, c_b2, c_b3 = st.columns(3)
-    with c_b1:
-        st.button("␣ Add Space", use_container_width=True, on_click=handle_space)
-    with c_b2:
-        st.button("⌫ Backspace", use_container_width=True, on_click=handle_backspace)
-    with c_b3:
-        st.button("🗑️ Clear", use_container_width=True, on_click=handle_clear)
-            
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Clean & Speak Area
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<div class="panel-subheader">🗣️ Speech & Translation Output</div>', unsafe_allow_html=True)
-    
-    full_text = (current_sentence + " " + current_word).strip()
-    
-    if st.button("🔊 Clean & Speak Sentence", use_container_width=True, type="secondary"):
-        if not full_text:
-            st.warning("Please sign a word or sentence first!")
+    @st.fragment(run_every=1.0)
+    def _live_controls():
+        proc_ctx = st.session_state.get("webrtc_ctx")
+        if proc_ctx and proc_ctx.video_processor:
+            with proc_ctx.video_processor.lock:
+                current_word = proc_ctx.video_processor.current_word
+                current_sentence = proc_ctx.video_processor.current_sentence
         else:
-            with st.spinner("AI is reconstructing sentence..."):
-                translation_success = False
-                system_prompt = """You are an legendary, ultra-intelligent AI communication assistant translating raw fingerspelled ASL text for a deaf or speech-impaired user.
+            current_word = st.session_state.current_word
+            current_sentence = st.session_state.current_sentence
+
+        st.markdown('<div class="glass-card glow-panel-right">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-subheader">⚙️ Configuration & Signing</div>', unsafe_allow_html=True)
+
+        if "dominant_hand_pick" not in st.session_state:
+            st.session_state.dominant_hand_pick = "Right"
+
+        st.radio(
+            "Dominant Signing Hand:",
+            ["Right", "Left"],
+            horizontal=True,
+            key="dominant_hand_pick",
+            on_change=_sync_dominant_hand,
+            help="Switches the stabilization focus to the selected hand.",
+        )
+        _sync_dominant_hand()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-subheader">📝 Construction Progress</div>', unsafe_allow_html=True)
+
+        metric_word = current_word if current_word else "_"
+        metric_sent = current_sentence if current_sentence else "..."
+
+        c_m1, c_m2 = st.columns(2)
+        with c_m1:
+            st.metric("Current Word", metric_word)
+        with c_m2:
+            st.metric("Accumulated Sentence", metric_sent)
+
+        c_b1, c_b2, c_b3 = st.columns(3)
+        with c_b1:
+            st.button("␣ Add Space", use_container_width=True, on_click=handle_space)
+        with c_b2:
+            st.button("⌫ Backspace", use_container_width=True, on_click=handle_backspace)
+        with c_b3:
+            st.button("🗑️ Clear", use_container_width=True, on_click=handle_clear)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-subheader">🗣️ Speech & Translation Output</div>', unsafe_allow_html=True)
+
+        full_text = (current_sentence + " " + current_word).strip()
+
+        if st.button("🔊 Clean & Speak Sentence", use_container_width=True, type="secondary"):
+            if not full_text:
+                st.warning("Please sign a word or sentence first!")
+            else:
+                with st.spinner("AI is reconstructing sentence..."):
+                    translation_success = False
+                    system_prompt = """You are an legendary, ultra-intelligent AI communication assistant translating raw fingerspelled ASL text for a deaf or speech-impaired user.
 The input is highly corrupted text generated live from a sign-recognition computer vision model. It has letter repetitions, missing vowels, visual spelling typos, and no punctuation.
 Your absolute core mission:
 - Deduplicate repeated letters and correct visual/spelling typos contextually.
@@ -694,48 +800,55 @@ Your absolute core mission:
 - Maintain the user's intent. If they signed shorthand like "GD MRNG", output "Good morning."
 - Return ONLY the final clean sentence. NEVER write any introduction, explanation, quotes, or meta-commentary."""
 
-                # Try Groq API First
-                if groq_client:
+                    if groq_client:
+                        try:
+                            response = groq_client.chat.completions.create(
+                                model="llama-3.1-8b-instant",
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": full_text},
+                                ],
+                                temperature=0.25,
+                                max_tokens=128,
+                            )
+                            st.session_state.groq_output = response.choices[0].message.content.strip()
+                            translation_success = True
+                        except Exception as e:
+                            st.warning(f"Groq API failed. Falling back to Gemini... ({e})")
+
+                    if not translation_success and gemini_api_key:
+                        try:
+                            st.session_state.groq_output = _gemini_clean_text(full_text, system_prompt)
+                            translation_success = True
+                        except Exception as e:
+                            st.error(f"Gemini API failed as well: {e}")
+
+                    if not translation_success:
+                        st.session_state.groq_output = full_text
+
                     try:
-                        response = groq_client.chat.completions.create(
-                            model="llama-3.1-8b-instant",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": full_text}
-                            ],
-                            temperature=0.25,
-                            max_tokens=128
-                        )
-                        st.session_state.groq_output = response.choices[0].message.content.strip()
-                        translation_success = True
+                        tts = gTTS(st.session_state.groq_output, lang="en")
+                        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                            tts.save(f.name)
+                            import base64
+                            with open(f.name, "rb") as audio_file:
+                                audio_bytes = audio_file.read()
+                            st.session_state.last_audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                            st.session_state.play_audio = True
+                            st.rerun() # Rerun whole app so audio can play outside the fragment
                     except Exception as e:
-                        st.warning(f"Groq API failed. Falling back to Gemini... ({e})")
-                
-                # Fallback to Gemini if Groq failed or is not available
-                if not translation_success and gemini_api_key:
-                    try:
-                        st.session_state.groq_output = _gemini_clean_text(
-                            full_text, system_prompt
-                        )
-                        translation_success = True
-                    except Exception as e:
-                        st.error(f"Gemini API failed as well: {e}")
-                
-                # If both failed or neither are configured
-                if not translation_success:
-                    st.session_state.groq_output = full_text
-                
-                # Speak via gTTS
-                try:
-                    tts = gTTS(st.session_state.groq_output, lang="en")
-                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                        tts.save(f.name)
-                        st.audio(f.name, format="audio/mp3", autoplay=True)
-                except Exception as e:
-                    st.error(f"TTS Error: {e}")
-                    
-    # Display translation result in an elegant success banner
-    if st.session_state.groq_output:
-        st.success(f"**Polished English**: {st.session_state.groq_output}")
-        
-    st.markdown('</div>', unsafe_allow_html=True)
+                        st.error(f"TTS Error: {e}")
+
+        if st.session_state.groq_output:
+            st.success(f"**Polished English**: {st.session_state.groq_output}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    _live_controls()
+    
+    # Render audio outside the fragment so it doesn't get interrupted every 1s
+    if st.session_state.get("last_audio_b64"):
+        import base64
+        st.audio(base64.b64decode(st.session_state.last_audio_b64), format="audio/mp3", autoplay=st.session_state.get("play_audio", False))
+        if st.session_state.get("play_audio", False):
+            st.session_state.play_audio = False
