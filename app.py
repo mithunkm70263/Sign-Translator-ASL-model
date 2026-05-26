@@ -517,7 +517,7 @@ with col_cam:
             ]
         },
         media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
+        async_processing=False,
     )
     
     # Instruction card beneath camera
