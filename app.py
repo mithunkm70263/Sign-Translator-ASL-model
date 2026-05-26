@@ -516,8 +516,15 @@ with col_cam:
                 {"urls": ["turn:openrelay.metered.ca:443?transport=tcp"], "username": "openrelayproject", "credential": "openrelayproject"},
             ]
         },
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=False,
+        media_stream_constraints={
+            "video": {
+                "width": {"ideal": 1280, "min": 640},
+                "height": {"ideal": 720, "min": 480},
+                "frameRate": {"ideal": 30, "max": 60}
+            },
+            "audio": False
+        },
+        async_processing=True,
     )
     
     # Instruction card beneath camera
