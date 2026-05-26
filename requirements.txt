@@ -5,7 +5,6 @@ numpy
 joblib
 groq
 gTTS
-streamlit-webrtc==0.47.0
-aiortc==1.8.0
+streamlit-webrtc
 av
 scikit-learn
