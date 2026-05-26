@@ -1,8 +1,10 @@
-# pyrefly: ignore [missing-import]
+
+import os
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+os.environ["MESA_D3D12_DEFAULT_ADAPTER_NAME"] = "Microsoft"
+
 import streamlit as st
-# pyrefly: ignore [missing-import]
 import cv2
-# pyrefly: ignore [missing-import]
 import mediapipe as mp
 import numpy as np
 import joblib
